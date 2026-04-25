@@ -743,3 +743,257 @@ async def test_supported_guid_type(test_config: Config):
     row = rows[0]
 
     assert row.get("guid_col") is not None
+
+
+# ---------------------------------------------------------------------------
+# Tests for bug fixes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_datetimeoffset_is_timezone_aware(test_config: Config):
+    """Regression test: DATETIMEOFFSET must return a timezone-aware datetime.
+
+    Previously the UTC offset was silently discarded and a naive datetime
+    (tzinfo=None) was returned.  The fix attaches datetime.timezone.utc so
+    callers can distinguish offset-aware values from plain datetimes.
+    """
+    import datetime
+
+    async with Connection(test_config.connection_string) as db_connection:
+        result = await db_connection.query("""
+            SELECT
+                CAST('2023-06-15 10:20:30.000 +05:30' AS DATETIMEOFFSET) as dto_val,
+                CAST('2023-06-15 10:20:30.000 +00:00' AS DATETIMEOFFSET) as dto_utc,
+                CAST(NULL AS DATETIMEOFFSET) as dto_null
+        """)
+
+    assert result.has_rows()
+    row = result.rows()[0]
+
+    # Non-null DATETIMEOFFSET must be a timezone-aware datetime
+    dto_val = row.get("dto_val")
+    assert dto_val is not None
+    assert isinstance(dto_val, datetime.datetime), (
+        f"Expected datetime, got {type(dto_val)}"
+    )
+    assert dto_val.tzinfo is not None, (
+        "DATETIMEOFFSET must return a timezone-aware datetime (tzinfo must not be None)"
+    )
+
+    # UTC value: Tiberius normalises all DATETIMEOFFSET values to UTC
+    dto_utc = row.get("dto_utc")
+    assert dto_utc is not None
+    assert dto_utc.tzinfo is not None, (
+        "DATETIMEOFFSET +00:00 must still be timezone-aware"
+    )
+    assert dto_utc.year == 2023
+    assert dto_utc.month == 6
+    assert dto_utc.day == 15
+    assert dto_utc.hour == 10
+    assert dto_utc.minute == 20
+    assert dto_utc.second == 30
+
+    # NULL must still be None
+    assert row.get("dto_null") is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_nullable_int_columns(test_config: Config):
+    """Regression test: nullable INT/BIGINT/SMALLINT columns use the Intn wire type.
+
+    Previously Intn fell through to a string-based fallback handler which
+    would fail or return wrong data for numeric values.  The fix adds a
+    dedicated handle_intn() that reads i64.
+    """
+    async with Connection(test_config.connection_string) as db_connection:
+        # A table variable forces SQL Server to produce Intn (nullable integer)
+        # column types rather than the non-nullable Int4/Int8 literals.
+        result = await db_connection.query("""
+            DECLARE @t TABLE (
+                col_int       INT          NULL,
+                col_bigint    BIGINT       NULL,
+                col_smallint  SMALLINT     NULL
+            )
+            INSERT INTO @t VALUES (42, 9223372036854775807, -32768)
+            INSERT INTO @t VALUES (NULL, NULL, NULL)
+            SELECT * FROM @t
+        """)
+
+    rows = result.rows()
+    assert len(rows) == 2
+
+    # First row — non-null values
+    row = rows[0]
+    assert row.get("col_int") == 42, (
+        f"Nullable INT should return 42, got {row.get('col_int')!r}"
+    )
+    assert row.get("col_bigint") == 9223372036854775807, (
+        f"Nullable BIGINT should return max i64, got {row.get('col_bigint')!r}"
+    )
+    assert row.get("col_smallint") == -32768, (
+        f"Nullable SMALLINT should return -32768, got {row.get('col_smallint')!r}"
+    )
+
+    # Second row — all NULL
+    row = rows[1]
+    assert row.get("col_int") is None
+    assert row.get("col_bigint") is None
+    assert row.get("col_smallint") is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_nullable_float_columns(test_config: Config):
+    """Regression test: nullable FLOAT/REAL columns use the Floatn wire type.
+
+    Previously Floatn fell through to a string-based fallback which would
+    fail for numeric data.  The fix adds a dedicated handle_floatn() that
+    reads f64.
+    """
+    async with Connection(test_config.connection_string) as db_connection:
+        result = await db_connection.query("""
+            DECLARE @t TABLE (
+                col_float  FLOAT  NULL,
+                col_real   REAL   NULL
+            )
+            INSERT INTO @t VALUES (3.14159265359, 2.718)
+            INSERT INTO @t VALUES (NULL, NULL)
+            SELECT * FROM @t
+        """)
+
+    rows = result.rows()
+    assert len(rows) == 2
+
+    # First row — non-null values
+    row = rows[0]
+    col_float = row.get("col_float")
+    assert col_float is not None, "Nullable FLOAT should not be None for a non-null row"
+    assert isinstance(col_float, float), (
+        f"Nullable FLOAT should return float, got {type(col_float)}"
+    )
+    assert abs(col_float - 3.14159265359) < 1e-6
+
+    col_real = row.get("col_real")
+    assert col_real is not None, "Nullable REAL should not be None for a non-null row"
+    assert isinstance(col_real, float), (
+        f"Nullable REAL should return float, got {type(col_real)}"
+    )
+    assert abs(col_real - 2.718) < 0.001
+
+    # Second row — all NULL
+    row = rows[1]
+    assert row.get("col_float") is None
+    assert row.get("col_real") is None
+
+
+# ---------------------------------------------------------------------------
+# MONEY / SMALLMONEY precision tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_money_returns_decimal(test_config: Config):
+    """MONEY and SMALLMONEY columns must come back as Decimal, not float."""
+    async with Connection(test_config.connection_string) as conn:
+        result = await conn.query(
+            "SELECT CAST(1.23 AS MONEY) AS m, CAST(1.23 AS SMALLMONEY) AS sm"
+        )
+    row = result.rows()[0]
+    assert isinstance(row.get("m"), Decimal), (
+        f"MONEY should be Decimal, got {type(row.get('m'))}"
+    )
+    assert isinstance(row.get("sm"), Decimal), (
+        f"SMALLMONEY should be Decimal, got {type(row.get('sm'))}"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_money_exact_four_decimal_places(test_config: Config):
+    """Values with all four significant decimal places must be exact."""
+    async with Connection(test_config.connection_string) as conn:
+        result = await conn.query(
+            "SELECT CAST(9999.9999 AS MONEY) AS m, CAST(9999.9999 AS SMALLMONEY) AS sm"
+        )
+    row = result.rows()[0]
+    assert row.get("m") == Decimal("9999.9999"), (
+        f"MONEY precision failure: {row.get('m')!r}"
+    )
+    assert row.get("sm") == Decimal("9999.9999"), (
+        f"SMALLMONEY precision failure: {row.get('sm')!r}"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_money_negative_value(test_config: Config):
+    """Negative MONEY/SMALLMONEY values must preserve sign and precision."""
+    async with Connection(test_config.connection_string) as conn:
+        result = await conn.query(
+            "SELECT CAST(-1234.5678 AS MONEY) AS m, CAST(-1234.5678 AS SMALLMONEY) AS sm"
+        )
+    row = result.rows()[0]
+    assert row.get("m") == Decimal("-1234.5678"), (
+        f"Negative MONEY precision failure: {row.get('m')!r}"
+    )
+    assert row.get("sm") == Decimal("-1234.5678"), (
+        f"Negative SMALLMONEY precision failure: {row.get('sm')!r}"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_money_zero(test_config: Config):
+    """Zero MONEY/SMALLMONEY must round-trip cleanly."""
+    async with Connection(test_config.connection_string) as conn:
+        result = await conn.query(
+            "SELECT CAST(0 AS MONEY) AS m, CAST(0 AS SMALLMONEY) AS sm"
+        )
+    row = result.rows()[0]
+    assert row.get("m") == Decimal("0"), f"MONEY zero failure: {row.get('m')!r}"
+    assert row.get("sm") == Decimal("0"), f"SMALLMONEY zero failure: {row.get('sm')!r}"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_money_null(test_config: Config):
+    """NULL MONEY/SMALLMONEY must come back as None."""
+    async with Connection(test_config.connection_string) as conn:
+        result = await conn.query(
+            "SELECT CAST(NULL AS MONEY) AS m, CAST(NULL AS SMALLMONEY) AS sm"
+        )
+    row = result.rows()[0]
+    assert row.get("m") is None, "NULL MONEY should be None"
+    assert row.get("sm") is None, "NULL SMALLMONEY should be None"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_money_no_precision_loss_vs_decimal_column(test_config: Config):
+    """The Decimal returned for MONEY must equal the same value from a DECIMAL column.
+
+    This is the regression test for the f64→Decimal precision bug: if the
+    conversion went through f64.to_string() any rounding artefact would make
+    the MONEY value differ from the exact DECIMAL value.
+    """
+    async with Connection(test_config.connection_string) as conn:
+        result = await conn.query("""
+            SELECT
+                CAST(1234.5679 AS MONEY)          AS money_val,
+                CAST(1234.5679 AS DECIMAL(18, 4)) AS decimal_val,
+                CAST(1234.5679 AS SMALLMONEY)     AS smallmoney_val
+        """)
+    row = result.rows()[0]
+    money_val = row.get("money_val")
+    decimal_val = row.get("decimal_val")
+    smallmoney_val = row.get("smallmoney_val")
+
+    assert money_val == decimal_val, (
+        f"MONEY {money_val!r} != DECIMAL {decimal_val!r}: precision loss detected"
+    )
+    assert smallmoney_val == decimal_val, (
+        f"SMALLMONEY {smallmoney_val!r} != DECIMAL {decimal_val!r}: precision loss detected"
+    )

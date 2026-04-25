@@ -110,6 +110,71 @@ class ApplicationIntent(StrEnum):
     READ_WRITE: str
     """Read-write workload."""
 
+class SqlError(Exception):
+    """
+    Raised when the SQL Server returns an error response.
+
+    Attributes:
+        code: SQL Server error number (e.g. 208 for object not found).
+        message: Human-readable error message from the server.
+        state: SQL Server error state byte.
+
+    Example::
+
+        try:
+            await conn.execute("INVALID SQL")
+        except SqlError as e:
+            print(e.code, e.message, e.state)
+    """
+    code: int
+    message: str
+    state: int
+    ...
+
+class SqlConnectionError(Exception):
+    """
+    Raised when a network I/O or routing error occurs connecting to SQL Server.
+
+    Attributes:
+        message: Human-readable error description, if provided by the underlying error.
+        host: Redirect target host for routing errors, if available.
+        port: Redirect target port for routing errors, if available.
+    """
+    message: Optional[str]
+    host: Optional[str]
+    port: Optional[int]
+    ...
+
+class TlsError(Exception):
+    """
+    Raised when a TLS/SSL handshake error occurs.
+
+    Attributes:
+        message: Human-readable error description.
+    """
+    message: str
+    ...
+
+class ProtocolError(Exception):
+    """
+    Raised when a protocol-level parsing error occurs during request or response handling.
+
+    Attributes:
+        message: Human-readable error description.
+    """
+    message: str
+    ...
+
+class ConversionError(Exception):
+    """
+    Raised when a type conversion or encoding error occurs.
+
+    Attributes:
+        message: Human-readable error description.
+    """
+    message: str
+    ...
+
 class SslConfig:
     """
     Configuration for SSL/TLS encrypted connections.
@@ -788,6 +853,10 @@ class Transaction:
         """Close the connection."""
         ...
 
+    def is_connected(self) -> bool:
+        """Return True if the underlying connection is currently established."""
+        ...
+
     async def __aenter__(self) -> Transaction:
         """Async context manager entry (begins transaction)."""
         ...
@@ -795,5 +864,35 @@ class Transaction:
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Async context manager exit (commits or rolls back)."""
         ...
+
+class TypedNull(StrEnum):
+    """Class to store a typed null value
+
+    This is required as some SQL Server features such as stored procedures etc. sometimes require type information for which is 
+    not possible for nulls when just using `None`. In such cases, SQL Server will complain about being unable to cast 'tinyint'
+    to the desired data type.
+
+    If a TypedNull is not explicitly used, fastmssql will default to using tinyint as the 'underlying type'
+    when sending to SQL server
+    """
+
+    TINYINT = "TINYINT"
+    SMALLINT = "SMALLINT"
+    INT = "INT"
+    BIGINT = "BIGINT"
+    FLOAT32 = "FLOAT32"
+    FLOAT64 = "FLOAT64"
+    BIT = "BIT"
+    STRING = "STRING"
+    GUID = "GUID"
+    BINARY = "BINARY"
+    NUMERIC = "NUMERIC"
+    XML = "XML"
+    DATETIME = "DATETIME"
+    SMALLDATETIME = "SMALLDATETIME"
+    TIME = "TIME"
+    DATE = "DATE"
+    DATETIME2 = "DATETIME2"
+    DATETIMEOFFSET = "DATETIMEOFFSET"
 
 def version() -> str: ...

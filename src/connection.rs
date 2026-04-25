@@ -13,7 +13,7 @@ use crate::parameter_conversion::{FastParameter, convert_parameters_to_fast};
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{ConnectionPool, ensure_pool_initialized_with_auth};
 use crate::ssl_config::PySslConfig;
-use crate::types::create_sql_error;
+use crate::types::{create_connection_error, create_sql_error};
 
 #[pyclass(name = "Connection")]
 pub struct PyConnection {
@@ -53,13 +53,9 @@ impl PyConnection {
         parameters: &[FastParameter],
     ) -> PyResult<Vec<Row>> {
         let mut conn = pool.get().await
-            .map_err(|e| {
-                // Only allocate error string if error actually occurred
-                if e.to_string().contains("timeout") {
-                    PyRuntimeError::new_err("Connection pool timeout - all connections are busy. Try reducing concurrent requests or increasing pool size.")
-                } else {
-                    PyRuntimeError::new_err(format!("Failed to get connection from pool: {}", e))
-                }
+            .map_err(|e| match e {
+                bb8::RunError::TimedOut => create_connection_error("Connection pool timeout - all connections are busy. Try reducing concurrent requests or increasing pool size."),
+                bb8::RunError::User(e) => create_connection_error(format!("Failed to get connection from pool: {}", e)),
             })?;
 
         let mut tiberius_params: SmallVec<[&dyn tiberius::ToSql; 16]> =
@@ -90,13 +86,9 @@ impl PyConnection {
         parameters: &[FastParameter],
     ) -> PyResult<u64> {
         let mut conn = pool.get().await
-            .map_err(|e| {
-                // Only allocate error string if error actually occurred
-                if e.to_string().contains("timeout") {
-                    PyRuntimeError::new_err("Connection pool timeout - all connections are busy. Try reducing concurrent requests or increasing pool size.")
-                } else {
-                    PyRuntimeError::new_err(format!("Failed to get connection from pool: {}", e))
-                }
+            .map_err(|e| match e {
+                bb8::RunError::TimedOut => create_connection_error("Connection pool timeout - all connections are busy. Try reducing concurrent requests or increasing pool size."),
+                bb8::RunError::User(e) => create_connection_error(format!("Failed to get connection from pool: {}", e)),
             })?;
 
         let mut tiberius_params: SmallVec<[&dyn tiberius::ToSql; 16]> =
@@ -345,7 +337,11 @@ impl PyConnection {
         _exc_value: Option<Bound<PyAny>>,
         _traceback: Option<Bound<PyAny>>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        future_into_py(py, async move { Ok(()) })
+        let pool = Arc::clone(&self.pool);
+        future_into_py(py, async move {
+            *pool.write().await = None;
+            Ok(())
+        })
     }
 
     /// Explicitly establish a connection (initialize the pool if not already connected)
@@ -388,6 +384,7 @@ impl PyConnection {
             Arc::clone(&self.pool),
             Arc::clone(&self.config),
             self.pool_config.clone(),
+            self.azure_credential.clone(),
             py,
             queries,
         )
@@ -404,6 +401,7 @@ impl PyConnection {
             Arc::clone(&self.pool),
             Arc::clone(&self.config),
             self.pool_config.clone(),
+            self.azure_credential.clone(),
             py,
             table_name,
             columns,
@@ -420,6 +418,7 @@ impl PyConnection {
             Arc::clone(&self.pool),
             Arc::clone(&self.config),
             self.pool_config.clone(),
+            self.azure_credential.clone(),
             py,
             commands,
         )

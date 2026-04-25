@@ -128,13 +128,22 @@ fn handle_binary(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
 }
 
 #[inline(always)]
+fn money_to_decimal_string(val: f64) -> String {
+    // MONEY/SMALLMONEY are stored on the wire as integer * 10^-4.
+    // Reconstruct via integer arithmetic so the f64 representation never
+    // introduces rounding artefacts into the final Decimal string.
+    let units = (val * 10_000.0).round() as i64;
+    let sign = if units < 0 { "-" } else { "" };
+    let abs_units = units.unsigned_abs();
+    format!("{}{}.{:04}", sign, abs_units / 10_000, abs_units % 10_000)
+}
+
+#[inline(always)]
 fn handle_money(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
     match row.try_get::<f64, usize>(index) {
         Ok(Some(val)) => {
-            // Convert to Decimal to preserve precision for financial data
             let decimal_class = py.import("decimal")?.getattr("Decimal")?;
-            let decimal_str = val.to_string();
-            Ok(decimal_class.call1((decimal_str,))?.unbind())
+            Ok(decimal_class.call1((money_to_decimal_string(val),))?.unbind())
         }
         Ok(None) => Ok(py.None()),
         Err(_) => Err(PyValueError::new_err(format!(
@@ -148,10 +157,8 @@ fn handle_money(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
 fn handle_money4(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
     match row.try_get::<f64, usize>(index) {
         Ok(Some(val)) => {
-            // Convert to Decimal to preserve precision for financial data
             let decimal_class = py.import("decimal")?.getattr("Decimal")?;
-            let decimal_str = val.to_string();
-            Ok(decimal_class.call1((decimal_str,))?.unbind())
+            Ok(decimal_class.call1((money_to_decimal_string(val),))?.unbind())
         }
         Ok(None) => Ok(py.None()),
         Err(_) => Err(PyValueError::new_err(format!(
@@ -245,6 +252,12 @@ fn handle_time(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
 fn handle_datetimeoffset(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
     match row.try_get::<chrono::DateTime<chrono::Utc>, usize>(index) {
         Ok(Some(val)) => {
+            let datetime_mod = py.import("datetime")?;
+            let timezone_class = datetime_mod.getattr("timezone")?;
+            let utc_obj = timezone_class.getattr("utc")?;
+            let tzinfo = utc_obj
+                .cast::<pyo3::types::PyTzInfo>()
+                .map_err(|_| PyValueError::new_err("Failed to get UTC timezone"))?;
             let dt = pyo3::types::PyDateTime::new(
                 py,
                 val.year(),
@@ -254,7 +267,7 @@ fn handle_datetimeoffset(row: &Row, index: usize, py: Python) -> PyResult<Py<PyA
                 val.minute() as u8,
                 val.second() as u8,
                 val.nanosecond() / 1000,
-                None,
+                Some(tzinfo),
             )?;
             Ok(dt.into_any().unbind())
         }
@@ -310,6 +323,30 @@ fn handle_nchar(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
 }
 
 #[inline(always)]
+fn handle_intn(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
+    match row.try_get::<i64, usize>(index) {
+        Ok(Some(val)) => Ok(val.into_pyobject(py)?.into_any().unbind()),
+        Ok(None) => Ok(py.None()),
+        Err(_) => Err(PyValueError::new_err(format!(
+            "Failed to convert column {} to integer",
+            index
+        ))),
+    }
+}
+
+#[inline(always)]
+fn handle_floatn(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
+    match row.try_get::<f64, usize>(index) {
+        Ok(Some(val)) => Ok(val.into_pyobject(py)?.into_any().unbind()),
+        Ok(None) => Ok(py.None()),
+        Err(_) => Err(PyValueError::new_err(format!(
+            "Failed to convert column {} to floating-point",
+            index
+        ))),
+    }
+}
+
+#[inline(always)]
 fn handle_fallback(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
     match row.try_get::<&str, usize>(index) {
         Ok(Some(val)) => Ok(val.into_pyobject(py)?.into_any().unbind()),
@@ -335,10 +372,10 @@ pub fn sql_to_python(
         ColumnType::Int8 => handle_int8(row, index, py),
         ColumnType::Int1 => handle_int1(row, index, py),
         ColumnType::Int2 => handle_int2(row, index, py),
-        ColumnType::Intn => handle_fallback(row, index, py), // Variable-length integer
+        ColumnType::Intn => handle_intn(row, index, py), // Variable-length integer
         ColumnType::Float8 => handle_float8(row, index, py),
         ColumnType::Float4 => handle_float4(row, index, py),
-        ColumnType::Floatn => handle_fallback(row, index, py), // Variable-length float
+        ColumnType::Floatn => handle_floatn(row, index, py), // Variable-length float
         ColumnType::NVarchar => handle_nvarchar(row, index, py),
         ColumnType::NChar => handle_nchar(row, index, py),
         ColumnType::BigVarChar | ColumnType::BigChar => handle_varchar(row, index, py),
